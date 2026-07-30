@@ -1,4 +1,6 @@
-from utube_snatcher.storage import UsageStorage
+import pytest
+
+from utube_snatcher.storage import LimitReachedError, UsageStorage
 
 
 def test_storage_tracks_users_and_downloads(tmp_path):
@@ -53,3 +55,31 @@ def test_storage_accepts_user_without_username(tmp_path):
     storage.finish_download(event_id, "success")
 
     assert storage.stats().top_users == (("id:99", 1),)
+
+
+def test_storage_enforces_daily_limit_atomically(tmp_path):
+    storage = UsageStorage(tmp_path / "usage.sqlite3")
+    storage.initialize()
+    storage.upsert_user(42, "alex", "Alex")
+
+    storage.start_download(42, "alex", "dQw4w9WgXcQ", "video", daily_limit=1)
+
+    with pytest.raises(LimitReachedError):
+        storage.start_download(42, "alex", "abcdefghijk", "audio", daily_limit=1)
+
+
+def test_storage_tracks_plan_block_and_maintenance(tmp_path):
+    storage = UsageStorage(tmp_path / "usage.sqlite3")
+    storage.initialize()
+    storage.upsert_user(42, "alex", "Alex")
+
+    assert storage.set_plan(42, "premium")
+    assert storage.set_blocked(42, True)
+    access = storage.user_access(42, free_limit=5, premium_limit=100)
+    assert access.plan == "premium"
+    assert access.is_blocked is True
+    assert access.daily_limit == 100
+
+    assert storage.maintenance_enabled() is False
+    storage.set_maintenance(True)
+    assert storage.maintenance_enabled() is True

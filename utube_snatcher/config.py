@@ -16,6 +16,10 @@ class Settings:
     database_path: Path = Path("data/utube_snatcher.sqlite3")
     admin_user_ids: frozenset[int] = frozenset()
     require_username: bool = False
+    free_daily_limit: int = 5
+    premium_daily_limit: int = 100
+    health_host: str = "0.0.0.0"
+    health_port: int = 8080
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -37,6 +41,10 @@ class Settings:
             database_path=Path(os.getenv("DATABASE_PATH", "data/utube_snatcher.sqlite3")),
             admin_user_ids=_integer_set("ADMIN_USER_IDS"),
             require_username=_boolean("REQUIRE_USERNAME", False),
+            free_daily_limit=_positive_int("FREE_DAILY_LIMIT", 5),
+            premium_daily_limit=_positive_int("PREMIUM_DAILY_LIMIT", 100),
+            health_host=os.getenv("HEALTH_HOST", "0.0.0.0"),
+            health_port=_positive_int("PORT", 8080),
         )
 
 

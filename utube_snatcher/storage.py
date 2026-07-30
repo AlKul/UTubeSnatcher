@@ -18,6 +18,22 @@ class UsageStats:
     top_users: tuple[tuple[str, int], ...]
 
 
+@dataclass(frozen=True)
+class UserAccess:
+    plan: str
+    is_blocked: bool
+    used_today: int
+    daily_limit: int
+
+    @property
+    def remaining(self) -> int:
+        return max(self.daily_limit - self.used_today, 0)
+
+
+class LimitReachedError(RuntimeError):
+    pass
+
+
 class UsageStorage:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -56,7 +72,21 @@ class UsageStorage:
                     ON download_events(created_at);
                 CREATE INDEX IF NOT EXISTS idx_download_events_user_id
                     ON download_events(user_id);
+
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
+            )
+            connection.execute(
+                """
+                UPDATE download_events
+                SET status = 'interrupted', error_code = 'process_restart',
+                    finished_at = ?
+                WHERE status = 'started'
+                """,
+                (_now(),),
             )
 
     def upsert_user(
@@ -86,8 +116,21 @@ class UsageStorage:
         username: str | None,
         video_id: str,
         media_kind: str,
+        daily_limit: int | None = None,
     ) -> int:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if daily_limit is not None:
+                used = connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM download_events
+                    WHERE user_id = ? AND created_at >= ?
+                    """,
+                    (user_id, _day_start()),
+                ).fetchone()[0]
+                if int(used) >= daily_limit:
+                    raise LimitReachedError("Daily download limit reached")
             cursor = connection.execute(
                 """
                 INSERT INTO download_events (
@@ -97,6 +140,72 @@ class UsageStorage:
                 (user_id, username, video_id, media_kind, _now()),
             )
             return int(cursor.lastrowid)
+
+    def user_access(
+        self,
+        user_id: int,
+        *,
+        free_limit: int,
+        premium_limit: int,
+    ) -> UserAccess:
+        with self._connect() as connection:
+            user = connection.execute(
+                "SELECT plan, is_blocked FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            used = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM download_events
+                WHERE user_id = ? AND created_at >= ?
+                """,
+                (user_id, _day_start()),
+            ).fetchone()[0]
+        plan = str(user[0]) if user else "free"
+        is_blocked = bool(user[1]) if user else False
+        daily_limit = premium_limit if plan == "premium" else free_limit
+        return UserAccess(
+            plan=plan,
+            is_blocked=is_blocked,
+            used_today=int(used),
+            daily_limit=daily_limit,
+        )
+
+    def set_plan(self, user_id: int, plan: str) -> bool:
+        if plan not in {"free", "premium"}:
+            raise ValueError("Unknown plan")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE users SET plan = ? WHERE user_id = ?",
+                (plan, user_id),
+            )
+            return cursor.rowcount > 0
+
+    def set_blocked(self, user_id: int, blocked: bool) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE users SET is_blocked = ? WHERE user_id = ?",
+                (int(blocked), user_id),
+            )
+            return cursor.rowcount > 0
+
+    def maintenance_enabled(self) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM app_settings WHERE key = 'maintenance'"
+            ).fetchone()
+        return bool(row and row[0] == "1")
+
+    def set_maintenance(self, enabled: bool) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO app_settings (key, value)
+                VALUES ('maintenance', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("1" if enabled else "0",),
+            )
 
     def finish_download(
         self,
@@ -170,3 +279,8 @@ class UsageStorage:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _day_start() -> str:
+    now = datetime.now(UTC)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
