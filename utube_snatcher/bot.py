@@ -7,6 +7,9 @@ from time import perf_counter
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -190,6 +193,7 @@ async def run(settings: Settings) -> None:
     bot = Bot(token=settings.bot_token)
     storage = UsageStorage(settings.database_path)
     storage.initialize()
+    await _configure_command_menu(bot, settings)
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
     try:
@@ -200,6 +204,23 @@ async def run(settings: Settings) -> None:
 
 def main() -> None:
     asyncio.run(run(Settings.from_env()))
+
+
+async def _configure_command_menu(bot: Bot, settings: Settings) -> None:
+    public_commands = [
+        BotCommand(command="start", description="Как пользоваться ботом"),
+        BotCommand(command="help", description="Помощь"),
+        BotCommand(command="whoami", description="Показать мой Telegram ID"),
+    ]
+    await bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
+    for admin_id in settings.admin_user_ids:
+        await bot.set_my_commands(
+            [
+                *public_commands,
+                BotCommand(command="stats", description="Закрытая статистика"),
+            ],
+            scope=BotCommandScopeChat(chat_id=admin_id),
+        )
 
 
 async def _register_user(
