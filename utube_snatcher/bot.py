@@ -19,13 +19,29 @@ from aiogram.types import (
 )
 
 from .config import Settings
-from .downloader import DownloadError, FileTooLargeError, download_media, get_title
+from .downloader import (
+    AuthenticationRequiredError,
+    DownloadError,
+    FileTooLargeError,
+    GeoRestrictedError,
+    MediaUnavailableError,
+    RateLimitedError,
+    download_media,
+    get_title,
+)
 from .health import start_health_server
 from .storage import LimitReachedError, UsageStats, UsageStorage, UserAccess
-from .urls import canonical_url, extract_youtube_id
+from .urls import parse_source_url
 
 logger = logging.getLogger(__name__)
 router = Router()
+REPORT_REASONS = {
+    "copyright": "Нарушение авторских прав",
+    "personal": "Персональные данные",
+    "prohibited": "Запрещённый контент",
+    "owner": "Материал принадлежит мне",
+    "other": "Другое",
+}
 
 
 @router.message(Command("start", "help"))
@@ -35,8 +51,8 @@ async def start(message: Message, settings: Settings, storage: UsageStorage) -> 
     if not await _service_available(message, message.from_user, settings, storage):
         return
     await message.answer(
-        "Пришли ссылку на YouTube-видео. Я предложу скачать видео или MP3.\n\n"
-        "Скачивай только материалы, на которые у тебя есть права."
+        "Пришли публичную ссылку на YouTube, VK, TikTok или Instagram. "
+        "Я предложу скачать видео или MP3."
     )
 
 
@@ -149,32 +165,51 @@ async def accept_url(
         return
     if not await _service_available(message, message.from_user, settings, storage):
         return
-    video_id = extract_youtube_id(message.text or "")
-    if not video_id:
+    source = parse_source_url(message.text or "")
+    if not source:
         await message.answer(
-            "Не удалось распознать ссылку. Поддерживаются обычные YouTube-ссылки, "
-            "youtu.be, Shorts и Live."
+            "Не удалось распознать ссылку. Поддерживаются публичные видео "
+            "YouTube, VK, TikTok и Instagram Reels/posts."
         )
         return
 
-    url = canonical_url(video_id)
-    status = await message.answer("Проверяю видео…")
-    try:
-        title = await get_title(url)
-    except DownloadError as exc:
-        logger.warning("Could not inspect %s: %s", video_id, exc)
-        await status.edit_text("Не удалось получить информацию о видео.")
+    if storage.is_source_blocked(source.platform, source.media_id):
+        await message.answer("Этот материал недоступен по результатам рассмотрения жалобы.")
         return
 
+    status = await message.answer("Проверяю публикацию…")
+    try:
+        title = await get_title(source.url)
+    except DownloadError as exc:
+        logger.warning("Could not inspect %s:%s: %s", source.platform, source.media_id, exc)
+        await status.edit_text(_download_error_message(exc, source.display_name))
+        return
+
+    request_id = storage.create_media_request(
+        user_id=message.from_user.id,
+        platform=source.platform,
+        source_id=source.media_id,
+        source_url=source.url,
+        title=title,
+    )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🎬 Видео", callback_data=f"download:video:{video_id}"),
-                InlineKeyboardButton(text="🎵 MP3", callback_data=f"download:audio:{video_id}"),
+                InlineKeyboardButton(
+                    text="🎬 Видео",
+                    callback_data=f"download:video:{request_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🎵 MP3",
+                    callback_data=f"download:audio:{request_id}",
+                ),
             ]
         ]
     )
-    await status.edit_text(f"Что скачать?\n\n{title}", reply_markup=keyboard)
+    await status.edit_text(
+        f"{source.display_name}\n\n{title}\n\nЧто скачать?",
+        reply_markup=keyboard,
+    )
 
 
 @router.callback_query(F.data.startswith("download:"))
@@ -200,9 +235,18 @@ async def handle_download(
         await callback.message.answer("Некорректная команда загрузки.")
         return
 
-    kind, video_id = parts[1], parts[2]
-    if extract_youtube_id(canonical_url(video_id)) != video_id:
-        await callback.message.answer("Некорректный идентификатор видео.")
+    kind = parts[1]
+    try:
+        request_id = int(parts[2])
+    except ValueError:
+        await callback.message.answer("Некорректный запрос загрузки.")
+        return
+    request = storage.media_request(request_id)
+    if request is None or request.user_id != callback.from_user.id:
+        await callback.message.answer("Запрос устарел. Пришли ссылку ещё раз.")
+        return
+    if storage.is_source_blocked(request.platform, request.source_id):
+        await callback.message.answer("Этот материал недоступен по результатам жалобы.")
         return
 
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -218,26 +262,58 @@ async def handle_download(
         event_id = storage.start_download(
             callback.from_user.id,
             callback.from_user.username,
-            video_id,
+            request.source_id,
             kind,
+            platform=request.platform,
             daily_limit=daily_limit,
         )
     except LimitReachedError:
+        storage.delete_media_request(request_id)
         await status.edit_text("Дневной лимит исчерпан. Посмотреть остаток можно командой /quota.")
         return
+    progress_queue: asyncio.Queue[int] = asyncio.Queue()
+    event_loop = asyncio.get_running_loop()
+
+    def progress_callback(percent: int) -> None:
+        event_loop.call_soon_threadsafe(progress_queue.put_nowait, percent)
+
+    progress_task = asyncio.create_task(_show_progress(status, progress_queue))
     try:
-        media = await download_media(
-            canonical_url(video_id),
-            kind=kind,
-            max_bytes=settings.max_upload_bytes,
-            timeout_seconds=settings.download_timeout_seconds,
-        )
+        try:
+            media = await download_media(
+                request.source_url,
+                kind=kind,
+                max_bytes=settings.max_upload_bytes,
+                timeout_seconds=settings.download_timeout_seconds,
+                progress_callback=progress_callback,
+            )
+        finally:
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
+
         document = FSInputFile(media.path, filename=media.path.name)
+        report_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⚠️ Пожаловаться",
+                        callback_data=f"report:{event_id}",
+                    )
+                ]
+            ]
+        )
         if kind == "audio":
-            await callback.message.answer_audio(document, title=media.title)
+            await callback.message.answer_audio(
+                document,
+                title=media.title,
+                reply_markup=report_keyboard,
+            )
         else:
             await callback.message.answer_video(
-                document, caption=media.title, supports_streaming=True
+                document,
+                caption=media.title,
+                supports_streaming=True,
+                reply_markup=report_keyboard,
             )
         storage.finish_download(
             event_id,
@@ -264,11 +340,13 @@ async def handle_download(
             duration_ms=_elapsed_ms(started_at),
             error_code=type(exc).__name__,
         )
-        logger.exception("Download failed for %s: %s", video_id, exc)
-        await status.edit_text(
-            "Не удалось скачать видео. YouTube мог временно ограничить запрос "
-            "или для ролика требуется авторизация."
+        logger.exception(
+            "Download failed for %s:%s: %s",
+            request.platform,
+            request.source_id,
+            exc,
         )
+        await status.edit_text(_download_error_message(exc, request.platform.title()))
     except Exception as exc:
         storage.finish_download(
             event_id,
@@ -276,11 +354,111 @@ async def handle_download(
             duration_ms=_elapsed_ms(started_at),
             error_code=type(exc).__name__,
         )
-        logger.exception("Unexpected failure for %s", video_id)
+        logger.exception("Unexpected failure for %s:%s", request.platform, request.source_id)
         await status.edit_text("Произошла внутренняя ошибка. Попробуй немного позже.")
     finally:
+        storage.delete_media_request(request_id)
         if media is not None:
             media.cleanup()
+
+
+@router.callback_query(F.data.startswith("report:"))
+async def report(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    event_id = (callback.data or "").split(":", 1)[-1]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"reportreason:{event_id}:{code}",
+                )
+            ]
+            for code, label in REPORT_REASONS.items()
+        ]
+    )
+    await callback.message.answer("Выбери причину жалобы:", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("reportreason:"))
+async def report_reason(
+    callback: CallbackQuery,
+    settings: Settings,
+    storage: UsageStorage,
+    bot: Bot,
+) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[2] not in REPORT_REASONS:
+        await callback.message.answer("Не удалось зарегистрировать жалобу.")
+        return
+    try:
+        event_id = int(parts[1])
+    except ValueError:
+        await callback.message.answer("Не удалось зарегистрировать жалобу.")
+        return
+    complaint = storage.create_complaint(
+        event_id,
+        callback.from_user.id,
+        parts[2],
+    )
+    if complaint is None:
+        await callback.message.answer("Материал для жалобы не найден.")
+        return
+    await callback.message.answer("Жалоба принята. Спасибо.")
+    admin_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🚫 Заблокировать материал",
+                    callback_data=f"reportadmin:block:{complaint.id}",
+                ),
+                InlineKeyboardButton(
+                    text="Отклонить",
+                    callback_data=f"reportadmin:dismiss:{complaint.id}",
+                ),
+            ]
+        ]
+    )
+    for admin_id in settings.admin_user_ids:
+        await bot.send_message(
+            admin_id,
+            f"Новая жалоба #{complaint.id}\n"
+            f"Площадка: {complaint.platform}\n"
+            f"Материал: {complaint.source_id}\n"
+            f"Заявитель: {complaint.reporter_id}\n"
+            f"Причина: {REPORT_REASONS[complaint.reason]}",
+            reply_markup=admin_keyboard,
+        )
+
+
+@router.callback_query(F.data.startswith("reportadmin:"))
+async def report_admin(
+    callback: CallbackQuery,
+    settings: Settings,
+    storage: UsageStorage,
+) -> None:
+    await callback.answer()
+    if callback.message is None or not _is_admin(callback.from_user, settings):
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in {"block", "dismiss"}:
+        return
+    try:
+        complaint_id = int(parts[2])
+    except ValueError:
+        return
+    resolved = storage.resolve_complaint(
+        complaint_id,
+        block_source=parts[1] == "block",
+    )
+    if resolved:
+        result = "Материал заблокирован." if parts[1] == "block" else "Жалоба отклонена."
+        await callback.message.edit_text(f"{callback.message.text}\n\n{result}")
 
 
 async def run(settings: Settings) -> None:
@@ -398,6 +576,46 @@ def _is_admin(user: User | None, settings: Settings) -> bool:
 def _command_argument(text: str) -> str:
     parts = text.split(maxsplit=1)
     return parts[1].strip().lower() if len(parts) == 2 else ""
+
+
+async def _show_progress(status: Message, queue: asyncio.Queue[int]) -> None:
+    last_bucket = 0
+    while True:
+        percent = await queue.get()
+        bucket = min(percent // 10 * 10, 100)
+        if bucket <= last_bucket:
+            continue
+        last_bucket = bucket
+        filled = bucket // 10
+        bar = "█" * filled + "░" * (10 - filled)
+        try:
+            await status.edit_text(f"Загружаю: {bar} {bucket}%")
+        except Exception:
+            logger.debug("Could not update download progress", exc_info=True)
+
+
+def _download_error_message(error: DownloadError, platform: str) -> str:
+    if isinstance(error, AuthenticationRequiredError):
+        return (
+            f"{platform} требует авторизацию или публикация закрыта. "
+            "Бот работает только с публичными материалами."
+        )
+    if isinstance(error, RateLimitedError):
+        return (
+            f"{platform} временно ограничил запросы. "
+            "Это не ошибка ссылки — попробуй повторить через несколько минут."
+        )
+    if isinstance(error, GeoRestrictedError):
+        return "Материал недоступен в регионе, где работает бот."
+    if isinstance(error, MediaUnavailableError):
+        return (
+            "Не удалось получить материал: он удалён, закрыт, недоступен "
+            "или такой тип публикации пока не поддерживается."
+        )
+    return (
+        "Не удалось загрузить материал из-за ответа площадки. "
+        "Попробуй ещё раз позже или пришли другую публичную ссылку."
+    )
 
 
 def _stats_days(text: str) -> int:

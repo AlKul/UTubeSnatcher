@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Literal
 
 from yt_dlp import YoutubeDL
+from yt_dlp.networking.impersonate import ImpersonateTarget
 
 MediaKind = Literal["audio", "video"]
 
@@ -17,6 +19,25 @@ class DownloadError(RuntimeError):
 
 class FileTooLargeError(DownloadError):
     pass
+
+
+class AuthenticationRequiredError(DownloadError):
+    pass
+
+
+class MediaUnavailableError(DownloadError):
+    pass
+
+
+class RateLimitedError(DownloadError):
+    pass
+
+
+class GeoRestrictedError(DownloadError):
+    pass
+
+
+ProgressCallback = Callable[[int], None]
 
 
 @dataclass(frozen=True)
@@ -39,10 +60,17 @@ async def download_media(
     kind: MediaKind,
     max_bytes: int,
     timeout_seconds: int,
+    progress_callback: ProgressCallback | None = None,
 ) -> DownloadedMedia:
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_download_sync, url, kind, max_bytes),
+            asyncio.to_thread(
+                _download_sync,
+                url,
+                kind,
+                max_bytes,
+                progress_callback,
+            ),
             timeout=timeout_seconds,
         )
     except TimeoutError as exc:
@@ -59,6 +87,7 @@ def _base_options() -> dict:
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
+        "impersonate": ImpersonateTarget(client="chrome"),
     }
 
 
@@ -69,11 +98,16 @@ def _get_title_sync(url: str) -> str:
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
-        raise DownloadError(f"Could not read video information: {exc}") from exc
+        raise _classified_error(exc) from exc
     return str(info.get("title") or "YouTube video")
 
 
-def _download_sync(url: str, kind: MediaKind, max_bytes: int) -> DownloadedMedia:
+def _download_sync(
+    url: str,
+    kind: MediaKind,
+    max_bytes: int,
+    progress_callback: ProgressCallback | None = None,
+) -> DownloadedMedia:
     tempdir = TemporaryDirectory(prefix="utube-snatcher-")
     output_template = str(Path(tempdir.name) / "%(title).120B-%(id)s.%(ext)s")
     options = _base_options()
@@ -83,6 +117,8 @@ def _download_sync(url: str, kind: MediaKind, max_bytes: int) -> DownloadedMedia
             "max_filesize": max_bytes,
         }
     )
+    if progress_callback is not None:
+        options["progress_hooks"] = [_progress_hook(progress_callback)]
 
     if kind == "audio":
         options.update(
@@ -117,7 +153,7 @@ def _download_sync(url: str, kind: MediaKind, max_bytes: int) -> DownloadedMedia
         raise
     except Exception as exc:
         tempdir.cleanup()
-        raise DownloadError(f"Download failed: {exc}") from exc
+        raise _classified_error(exc) from exc
 
     if path.stat().st_size > max_bytes:
         tempdir.cleanup()
@@ -149,3 +185,55 @@ def _find_output(directory: Path, prepared_filename: str, kind: MediaKind) -> Pa
     if not media_files:
         raise FileTooLargeError("yt-dlp did not produce a file within the configured size limit")
     return max(media_files, key=lambda path: path.stat().st_mtime)
+
+
+def _progress_hook(callback: ProgressCallback):
+    def hook(data: dict) -> None:
+        if data.get("status") != "downloading":
+            return
+        downloaded = int(data.get("downloaded_bytes") or 0)
+        total = int(data.get("total_bytes") or data.get("total_bytes_estimate") or 0)
+        if total > 0:
+            callback(min(round(downloaded * 100 / total), 100))
+
+    return hook
+
+
+def _classified_error(exc: Exception) -> DownloadError:
+    message = str(exc).lower()
+    if any(
+        marker in message
+        for marker in (
+            "login required",
+            "sign in",
+            "cookies",
+            "private video",
+            "private account",
+        )
+    ):
+        return AuthenticationRequiredError("The source requires authentication")
+    if any(
+        marker in message
+        for marker in (
+            "429",
+            "too many requests",
+            "rate limit",
+            "ip address is blocked",
+        )
+    ):
+        return RateLimitedError("The source temporarily limited requests")
+    if any(marker in message for marker in ("geo", "not available in your country")):
+        return GeoRestrictedError("The media is unavailable in this region")
+    if any(
+        marker in message
+        for marker in (
+            "video unavailable",
+            "post is unavailable",
+            "not available",
+            "removed",
+            "unsupported url",
+            "no video formats",
+        )
+    ):
+        return MediaUnavailableError("The media is unavailable or unsupported")
+    return DownloadError(f"Download failed: {exc}")
