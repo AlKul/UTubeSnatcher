@@ -1,4 +1,4 @@
-from utube_snatcher.bot import _human_bytes, _stats_days
+from utube_snatcher.bot import _command_argument, _human_bytes, _stats_days
 
 
 def test_stats_days():
@@ -12,3 +12,8 @@ def test_human_bytes():
     assert _human_bytes(0) == "0.0 Б"
     assert _human_bytes(1024) == "1.0 КБ"
     assert _human_bytes(5 * 1024 * 1024) == "5.0 МБ"
+
+
+def test_command_argument():
+    assert _command_argument("/maintenance") == ""
+    assert _command_argument("/maintenance ON") == "on"

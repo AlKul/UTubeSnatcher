@@ -24,12 +24,18 @@ def test_settings_parse_limits(monkeypatch):
     monkeypatch.setenv("DOWNLOAD_TIMEOUT_SECONDS", "15")
     monkeypatch.setenv("ADMIN_USER_IDS", "123, 456")
     monkeypatch.setenv("REQUIRE_USERNAME", "false")
+    monkeypatch.setenv("FREE_DAILY_LIMIT", "7")
+    monkeypatch.setenv("PREMIUM_DAILY_LIMIT", "200")
+    monkeypatch.setenv("PORT", "9000")
     settings = Settings.from_env()
     assert settings.bot_token == "test-token"
     assert settings.max_upload_bytes == 42 * 1024 * 1024
     assert settings.download_timeout_seconds == 15
     assert settings.admin_user_ids == frozenset({123, 456})
     assert settings.require_username is False
+    assert settings.free_daily_limit == 7
+    assert settings.premium_daily_limit == 200
+    assert settings.health_port == 9000
 
 
 def test_settings_reject_invalid_admin_id(monkeypatch):
