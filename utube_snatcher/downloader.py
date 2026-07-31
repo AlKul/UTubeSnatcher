@@ -61,6 +61,7 @@ async def download_media(
     max_bytes: int,
     timeout_seconds: int,
     progress_callback: ProgressCallback | None = None,
+    clip_range: tuple[int, int] | None = None,
 ) -> DownloadedMedia:
     try:
         return await asyncio.wait_for(
@@ -70,6 +71,7 @@ async def download_media(
                 kind,
                 max_bytes,
                 progress_callback,
+                clip_range,
             ),
             timeout=timeout_seconds,
         )
@@ -107,6 +109,7 @@ def _download_sync(
     kind: MediaKind,
     max_bytes: int,
     progress_callback: ProgressCallback | None = None,
+    clip_range: tuple[int, int] | None = None,
 ) -> DownloadedMedia:
     tempdir = TemporaryDirectory(prefix="utube-snatcher-")
     output_template = str(Path(tempdir.name) / "%(title).120B-%(id)s.%(ext)s")
@@ -119,6 +122,14 @@ def _download_sync(
     )
     if progress_callback is not None:
         options["progress_hooks"] = [_progress_hook(progress_callback)]
+    if clip_range is not None:
+        start, end = clip_range
+        options.update(
+            {
+                "download_sections": [f"*{start}-{end}"],
+                "force_keyframes_at_cuts": True,
+            }
+        )
 
     if kind == "audio":
         options.update(
