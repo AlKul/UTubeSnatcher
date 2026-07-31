@@ -83,3 +83,40 @@ def test_storage_tracks_plan_block_and_maintenance(tmp_path):
     assert storage.maintenance_enabled() is False
     storage.set_maintenance(True)
     assert storage.maintenance_enabled() is True
+
+
+def test_storage_tracks_requests_complaints_and_source_block(tmp_path):
+    storage = UsageStorage(tmp_path / "usage.sqlite3")
+    storage.initialize()
+    storage.upsert_user(42, "alex", "Alex")
+    request_id = storage.create_media_request(
+        user_id=42,
+        platform="tiktok",
+        source_id="123456",
+        source_url="https://www.tiktok.com/@alex/video/123456",
+        title="Test",
+    )
+    request = storage.media_request(request_id)
+    assert request is not None
+    assert request.platform == "tiktok"
+
+    event_id = storage.start_download(
+        42,
+        "alex",
+        "123456",
+        "video",
+        platform="tiktok",
+    )
+    storage.finish_download(event_id, "success")
+    complaint = storage.create_complaint(event_id, 42, "copyright")
+    assert complaint is not None
+    assert storage.resolve_complaint(complaint.id, block_source=True)
+    assert storage.is_source_blocked("tiktok", "123456")
+
+
+def test_user_cannot_complain_about_another_users_event(tmp_path):
+    storage = UsageStorage(tmp_path / "usage.sqlite3")
+    storage.initialize()
+    storage.upsert_user(42, "alex", "Alex")
+    event_id = storage.start_download(42, "alex", "video-id", "video")
+    assert storage.create_complaint(event_id, 99, "other") is None

@@ -34,6 +34,26 @@ class LimitReachedError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class MediaRequest:
+    id: int
+    user_id: int
+    platform: str
+    source_id: str
+    source_url: str
+    title: str
+
+
+@dataclass(frozen=True)
+class Complaint:
+    id: int
+    event_id: int
+    reporter_id: int
+    platform: str
+    source_id: str
+    reason: str
+
+
 class UsageStorage:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -58,6 +78,7 @@ class UsageStorage:
                     user_id INTEGER NOT NULL,
                     username TEXT,
                     video_id TEXT NOT NULL,
+                    platform TEXT NOT NULL DEFAULT 'youtube',
                     media_kind TEXT NOT NULL CHECK(media_kind IN ('audio', 'video')),
                     status TEXT NOT NULL,
                     bytes_sent INTEGER,
@@ -77,7 +98,43 @@ class UsageStorage:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS media_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    platform TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS complaints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id INTEGER NOT NULL,
+                    reporter_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    FOREIGN KEY(event_id) REFERENCES download_events(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS blocked_sources (
+                    platform TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(platform, source_id)
+                );
                 """
+            )
+            _ensure_column(
+                connection,
+                "download_events",
+                "platform",
+                "TEXT NOT NULL DEFAULT 'youtube'",
             )
             connection.execute(
                 """
@@ -116,6 +173,7 @@ class UsageStorage:
         username: str | None,
         video_id: str,
         media_kind: str,
+        platform: str = "youtube",
         daily_limit: int | None = None,
     ) -> int:
         with self._connect() as connection:
@@ -134,12 +192,136 @@ class UsageStorage:
             cursor = connection.execute(
                 """
                 INSERT INTO download_events (
-                    user_id, username, video_id, media_kind, status, created_at
-                ) VALUES (?, ?, ?, ?, 'started', ?)
+                    user_id, username, video_id, platform, media_kind, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'started', ?)
                 """,
-                (user_id, username, video_id, media_kind, _now()),
+                (user_id, username, video_id, platform, media_kind, _now()),
             )
             return int(cursor.lastrowid)
+
+    def create_media_request(
+        self,
+        *,
+        user_id: int,
+        platform: str,
+        source_id: str,
+        source_url: str,
+        title: str,
+    ) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO media_requests (
+                    user_id, platform, source_id, source_url, title, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, platform, source_id, source_url, title, _now()),
+            )
+            return int(cursor.lastrowid)
+
+    def media_request(self, request_id: int) -> MediaRequest | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, user_id, platform, source_id, source_url, title
+                FROM media_requests WHERE id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+        return MediaRequest(*row) if row else None
+
+    def delete_media_request(self, request_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM media_requests WHERE id = ?", (request_id,))
+
+    def is_source_blocked(self, platform: str, source_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM blocked_sources
+                WHERE platform = ? AND source_id = ?
+                """,
+                (platform, source_id),
+            ).fetchone()
+        return row is not None
+
+    def create_complaint(
+        self,
+        event_id: int,
+        reporter_id: int,
+        reason: str,
+    ) -> Complaint | None:
+        with self._connect() as connection:
+            event = connection.execute(
+                "SELECT platform, video_id, user_id FROM download_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            if event is None or int(event[2]) != reporter_id:
+                return None
+            existing = connection.execute(
+                """
+                SELECT id FROM complaints
+                WHERE event_id = ? AND reporter_id = ? AND status = 'open'
+                """,
+                (event_id, reporter_id),
+            ).fetchone()
+            if existing:
+                complaint_id = int(existing[0])
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO complaints (
+                        event_id, reporter_id, reason, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (event_id, reporter_id, reason, _now()),
+                )
+                complaint_id = int(cursor.lastrowid)
+        return Complaint(
+            complaint_id,
+            event_id,
+            reporter_id,
+            str(event[0]),
+            str(event[1]),
+            reason,
+        )
+
+    def resolve_complaint(
+        self,
+        complaint_id: int,
+        *,
+        block_source: bool,
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT e.platform, e.video_id
+                FROM complaints c
+                JOIN download_events e ON e.id = c.event_id
+                WHERE c.id = ? AND c.status = 'open'
+                """,
+                (complaint_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if block_source:
+                connection.execute(
+                    """
+                    INSERT INTO blocked_sources (
+                        platform, source_id, reason, created_at
+                    ) VALUES (?, ?, 'complaint', ?)
+                    ON CONFLICT(platform, source_id) DO NOTHING
+                    """,
+                    (row[0], row[1], _now()),
+                )
+            connection.execute(
+                """
+                UPDATE complaints SET status = ?, resolved_at = ?
+                WHERE id = ?
+                """,
+                ("blocked" if block_source else "dismissed", _now(), complaint_id),
+            )
+            return True
 
     def user_access(
         self,
@@ -284,3 +466,14 @@ def _now() -> str:
 def _day_start() -> str:
     now = datetime.now(UTC)
     return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def _ensure_column(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    columns = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
