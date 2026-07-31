@@ -353,6 +353,9 @@ async def run_clip(
             await callback.message.answer_video(
                 document,
                 caption=f"{media.title}\n{_format_time(start)}–{_format_time(end)}",
+                width=media.width,
+                height=media.height,
+                duration=end - start,
                 supports_streaming=True,
             )
         storage.finish_download(
@@ -506,6 +509,9 @@ async def handle_download(
             await callback.message.answer_video(
                 document,
                 caption=media.title,
+                width=media.width,
+                height=media.height,
+                duration=media.duration,
                 supports_streaming=True,
                 reply_markup=report_keyboard,
             )

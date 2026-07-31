@@ -9,6 +9,7 @@ from typing import Literal
 
 from yt_dlp import YoutubeDL
 from yt_dlp.networking.impersonate import ImpersonateTarget
+from yt_dlp.utils import download_range_func
 
 MediaKind = Literal["audio", "video"]
 
@@ -45,6 +46,9 @@ class DownloadedMedia:
     path: Path
     title: str
     kind: MediaKind
+    width: int | None
+    height: int | None
+    duration: int | None
     _tempdir: TemporaryDirectory[str]
 
     def cleanup(self) -> None:
@@ -126,7 +130,7 @@ def _download_sync(
         start, end = clip_range
         options.update(
             {
-                "download_sections": [f"*{start}-{end}"],
+                "download_ranges": download_range_func(None, [(start, end)]),
                 "force_keyframes_at_cuts": True,
             }
         )
@@ -174,8 +178,18 @@ def _download_sync(
         path=path,
         title=str(info.get("title") or path.stem),
         kind=kind,
+        width=_optional_int(info.get("width")) if kind == "video" else None,
+        height=_optional_int(info.get("height")) if kind == "video" else None,
+        duration=_optional_int(info.get("duration")),
         _tempdir=tempdir,
     )
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        return round(float(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _find_output(directory: Path, prepared_filename: str, kind: MediaKind) -> Path:
