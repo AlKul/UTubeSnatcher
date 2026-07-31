@@ -145,6 +145,10 @@ class UsageStorage:
                 """,
                 (_now(),),
             )
+            connection.execute(
+                "DELETE FROM media_requests WHERE created_at < ?",
+                ((datetime.now(UTC) - timedelta(days=30)).isoformat(),),
+            )
 
     def upsert_user(
         self,

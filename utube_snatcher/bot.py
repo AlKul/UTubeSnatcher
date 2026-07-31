@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from time import perf_counter
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
@@ -42,6 +45,10 @@ REPORT_REASONS = {
     "owner": "Материал принадлежит мне",
     "other": "Другое",
 }
+
+
+class ClipForm(StatesGroup):
+    waiting_for_range = State()
 
 
 @router.message(Command("start", "help"))
@@ -155,7 +162,7 @@ async def block(message: Message, settings: Settings, storage: UsageStorage) -> 
         await message.answer("Пользователь ещё не запускал бота.")
 
 
-@router.message(F.text)
+@router.message(StateFilter(None), F.text)
 async def accept_url(
     message: Message,
     settings: Settings,
@@ -210,6 +217,198 @@ async def accept_url(
         f"{source.display_name}\n\n{title}\n\nЧто скачать?",
         reply_markup=keyboard,
     )
+
+
+@router.callback_query(F.data.startswith("clip:"))
+async def request_clip(
+    callback: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+    storage: UsageStorage,
+) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    if not await _service_available(callback.message, callback.from_user, settings, storage):
+        return
+    try:
+        request_id = int((callback.data or "").split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.message.answer("Не удалось открыть редактор фрагмента.")
+        return
+    request = storage.media_request(request_id)
+    if request is None or request.user_id != callback.from_user.id:
+        await callback.message.answer("Исходная ссылка устарела. Пришли её ещё раз.")
+        return
+    await state.set_state(ClipForm.waiting_for_range)
+    await state.update_data(request_id=request_id)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✕ Отмена", callback_data="clipcancel")]]
+    )
+    await callback.message.answer(
+        "✂️ Укажи начало и конец фрагмента.\n\nНапример: <code>01:20–02:45</code>",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data == "clipcancel")
+async def cancel_clip(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer("Отменено")
+    await state.clear()
+    if callback.message is not None:
+        await callback.message.edit_text("Нарезка отменена.")
+
+
+@router.message(ClipForm.waiting_for_range, F.text)
+async def receive_clip_range(message: Message, state: FSMContext) -> None:
+    clip_range = _parse_clip_range(message.text or "")
+    if clip_range is None:
+        await message.answer(
+            "Не поняла таймкоды. Пришли их так: <code>01:20–02:45</code>",
+            parse_mode="HTML",
+        )
+        return
+    start, end = clip_range
+    data = await state.get_data()
+    request_id = int(data["request_id"])
+    await state.clear()
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎬 Создать видео",
+                    callback_data=f"cliprun:video:{request_id}:{start}:{end}",
+                ),
+                InlineKeyboardButton(
+                    text="🎧 Только аудио",
+                    callback_data=f"cliprun:audio:{request_id}:{start}:{end}",
+                ),
+            ],
+            [InlineKeyboardButton(text="✕ Отмена", callback_data="clipcancel")],
+        ]
+    )
+    await message.answer(
+        f"Фрагмент: {_format_time(start)}–{_format_time(end)}\n"
+        f"Длительность: {_human_duration(end - start)}",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("cliprun:"))
+async def run_clip(
+    callback: CallbackQuery,
+    settings: Settings,
+    storage: UsageStorage,
+) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    if not await _service_available(callback.message, callback.from_user, settings, storage):
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 5 or parts[1] not in {"video", "audio"}:
+        await callback.message.answer("Некорректные параметры фрагмента.")
+        return
+    try:
+        request_id, start, end = map(int, parts[2:])
+    except ValueError:
+        await callback.message.answer("Некорректные таймкоды.")
+        return
+    request = storage.media_request(request_id)
+    if request is None or request.user_id != callback.from_user.id:
+        await callback.message.answer("Исходная ссылка устарела. Пришли её ещё раз.")
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    status = await callback.message.answer("✂️ Подготавливаю фрагмент…")
+    media = None
+    started_at = perf_counter()
+    daily_limit = None
+    if callback.from_user.id not in settings.admin_user_ids:
+        daily_limit = _user_access(callback.from_user.id, settings, storage).daily_limit
+    try:
+        event_id = storage.start_download(
+            callback.from_user.id,
+            callback.from_user.username,
+            request.source_id,
+            parts[1],
+            platform=request.platform,
+            daily_limit=daily_limit,
+        )
+    except LimitReachedError:
+        await status.edit_text("Дневной лимит исчерпан. Посмотреть остаток можно командой /quota.")
+        return
+    try:
+        media = await download_media(
+            request.source_url,
+            kind=parts[1],
+            max_bytes=settings.max_upload_bytes,
+            timeout_seconds=settings.download_timeout_seconds,
+            clip_range=(start, end),
+        )
+        document = FSInputFile(media.path, filename=media.path.name)
+        if parts[1] == "audio":
+            await callback.message.answer_audio(document, title=media.title)
+        else:
+            await callback.message.answer_video(
+                document,
+                caption=f"{media.title}\n{_format_time(start)}–{_format_time(end)}",
+                supports_streaming=True,
+            )
+        storage.finish_download(
+            event_id,
+            "success",
+            bytes_sent=media.path.stat().st_size,
+            duration_ms=_elapsed_ms(started_at),
+        )
+        await status.delete()
+        await callback.message.answer(
+            "✅ Фрагмент готов.",
+            reply_markup=_post_download_keyboard(request_id),
+        )
+    except FileTooLargeError:
+        storage.finish_download(
+            event_id,
+            "too_large",
+            duration_ms=_elapsed_ms(started_at),
+            error_code="too_large",
+        )
+        await status.edit_text("Фрагмент всё ещё не помещается в лимит Telegram.")
+    except DownloadError as exc:
+        storage.finish_download(
+            event_id,
+            "download_error",
+            duration_ms=_elapsed_ms(started_at),
+            error_code=type(exc).__name__,
+        )
+        await status.edit_text(_download_error_message(exc, request.platform.title()))
+    except Exception as exc:
+        storage.finish_download(
+            event_id,
+            "internal_error",
+            duration_ms=_elapsed_ms(started_at),
+            error_code=type(exc).__name__,
+        )
+        logger.exception("Unexpected clip failure for %s:%s", request.platform, request.source_id)
+        await status.edit_text("Не удалось подготовить фрагмент. Попробуй ещё раз позже.")
+    finally:
+        if media is not None:
+            media.cleanup()
+
+
+@router.callback_query(F.data.startswith("posthide:"))
+async def hide_post_menu(callback: CallbackQuery, storage: UsageStorage) -> None:
+    await callback.answer()
+    try:
+        request_id = int((callback.data or "").split(":", 1)[1])
+    except (ValueError, IndexError):
+        request_id = 0
+    if request_id:
+        request = storage.media_request(request_id)
+        if request is not None and request.user_id == callback.from_user.id:
+            storage.delete_media_request(request_id)
+    if callback.message is not None:
+        await callback.message.edit_text("✅ Готово")
 
 
 @router.callback_query(F.data.startswith("download:"))
@@ -294,12 +493,7 @@ async def handle_download(
         document = FSInputFile(media.path, filename=media.path.name)
         report_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⚠️ Пожаловаться",
-                        callback_data=f"report:{event_id}",
-                    )
-                ]
+                [InlineKeyboardButton(text="⚠️ Пожаловаться", callback_data=f"report:{event_id}")]
             ]
         )
         if kind == "audio":
@@ -322,6 +516,10 @@ async def handle_download(
             duration_ms=_elapsed_ms(started_at),
         )
         await status.delete()
+        await callback.message.answer(
+            "✅ Готово. Что-нибудь ещё?",
+            reply_markup=_post_download_keyboard(request_id),
+        )
     except FileTooLargeError:
         storage.finish_download(
             event_id,
@@ -357,7 +555,6 @@ async def handle_download(
         logger.exception("Unexpected failure for %s:%s", request.platform, request.source_id)
         await status.edit_text("Произошла внутренняя ошибка. Попробуй немного позже.")
     finally:
-        storage.delete_media_request(request_id)
         if media is not None:
             media.cleanup()
 
@@ -616,6 +813,54 @@ def _download_error_message(error: DownloadError, platform: str) -> str:
         "Не удалось загрузить материал из-за ответа площадки. "
         "Попробуй ещё раз позже или пришли другую публичную ссылку."
     )
+
+
+def _post_download_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✂️ Вырезать фрагмент", callback_data=f"clip:{request_id}")],
+            [InlineKeyboardButton(text="✕ Скрыть меню", callback_data=f"posthide:{request_id}")],
+        ]
+    )
+
+
+def _parse_clip_range(text: str) -> tuple[int, int] | None:
+    parts = re.findall(r"(?<!\d)(\d{1,2}:\d{1,2}(?::\d{1,2})?|\d+)(?!\d)", text)
+    if len(parts) != 2:
+        return None
+    try:
+        start, end = (_time_to_seconds(value) for value in parts)
+    except ValueError:
+        return None
+    if start < 0 or end <= start or end - start > 3600:
+        return None
+    return start, end
+
+
+def _time_to_seconds(value: str) -> int:
+    chunks = [int(chunk) for chunk in value.split(":")]
+    if len(chunks) == 1:
+        return chunks[0]
+    if len(chunks) == 2 and chunks[1] < 60:
+        return chunks[0] * 60 + chunks[1]
+    if len(chunks) == 3 and chunks[1] < 60 and chunks[2] < 60:
+        return chunks[0] * 3600 + chunks[1] * 60 + chunks[2]
+    raise ValueError("Invalid timestamp")
+
+
+def _format_time(seconds: int) -> str:
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def _human_duration(seconds: int) -> str:
+    minutes, secs = divmod(seconds, 60)
+    if minutes and secs:
+        return f"{minutes} мин {secs} сек"
+    if minutes:
+        return f"{minutes} мин"
+    return f"{secs} сек"
 
 
 def _stats_days(text: str) -> int:

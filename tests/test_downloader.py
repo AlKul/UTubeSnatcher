@@ -42,6 +42,43 @@ def test_progress_hook_reports_percentage():
     assert values == [50]
 
 
+def test_clip_options_are_forwarded_to_ytdlp(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeYdl:
+        def __init__(self, options):
+            captured.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def extract_info(self, url, download):
+            output = tmp_path / "clip.mp4"
+            output.write_bytes(b"clip")
+            return {"title": "Clip", "id": "id", "ext": "mp4"}
+
+        def prepare_filename(self, info):
+            return str(tmp_path / "clip.mp4")
+
+    monkeypatch.setattr("utube_snatcher.downloader.YoutubeDL", FakeYdl)
+    from utube_snatcher.downloader import _download_sync
+
+    media = _download_sync(
+        "https://example.test/video",
+        "video",
+        1024,
+        clip_range=(80, 165),
+    )
+    try:
+        assert captured["download_sections"] == ["*80-165"]
+        assert captured["force_keyframes_at_cuts"] is True
+    finally:
+        media.cleanup()
+
+
 @pytest.mark.parametrize(
     ("message", "error_type"),
     [
