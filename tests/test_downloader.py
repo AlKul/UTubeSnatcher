@@ -73,7 +73,8 @@ def test_clip_options_are_forwarded_to_ytdlp(monkeypatch, tmp_path):
         clip_range=(80, 165),
     )
     try:
-        assert captured["download_sections"] == ["*80-165"]
+        ranges = tuple(captured["download_ranges"]({}, None))
+        assert ranges == ({"start_time": 80, "end_time": 165},)
         assert captured["force_keyframes_at_cuts"] is True
     finally:
         media.cleanup()
